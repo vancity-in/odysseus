@@ -1,0 +1,148 @@
+# Why this fork exists at all:
+#
+# odysseus-dev/odysseus ships a perfectly good .github/workflows/docker-publish.yml
+# that pushes to ghcr.io/<owner>/<repo> — but the upstream package is PRIVATE.
+# An anonymous pull of ghcr.io/odysseus-dev/odysseus gets 401 on the token
+# endpoint and 403 on the manifest, so Railway cannot pull it. There is no
+# official public image for Odysseus. This workflow rebuilds upstream's own
+# Dockerfile, unmodified, under our org and publishes the result publicly.
+#
+# Branch contract (do not break this):
+#   main    — a pure mirror of upstream's `main`. Fast-forwarded by this
+#             workflow, never hand-edited. `main` is upstream's CURATED stable
+#             branch (they fast-forward it at each release); `dev` is their
+#             firehose. We track `main` deliberately.
+#   vancity — the default branch. Holds ONLY this workflow. Kept separate so
+#             `main` never diverges from upstream and the sync stays a
+#             fast-forward forever. Scheduled workflows only run from the
+#             default branch, which is why this file lives here and not on main.
+#
+# Odysseus is AGPL-3.0. This fork is public, which is what keeps redistributing
+# a built image compliant — the corresponding source is the commit we build.
+
+name: Sync upstream stable and publish to GHCR
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Rebuild even if upstream has not moved'
+        type: boolean
+        default: false
+  schedule:
+    # 04:20 UTC daily. Upstream fast-forwards `main` only at releases, so most
+    # runs are a no-op sync that exits before the expensive build.
+    - cron: '20 4 * * *'
+
+concurrency:
+  group: vancity-build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: https://github.com/odysseus-dev/odysseus.git
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    name: Fast-forward main from upstream
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      short: ${{ steps.resolve.outputs.short }}
+      changed: ${{ steps.resolve.outputs.changed }}
+    steps:
+      - name: Checkout (vancity branch, workflow only)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve upstream main and fast-forward our mirror
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git remote add upstream "$UPSTREAM"
+          git fetch --no-tags upstream main
+
+          upstream_sha="$(git rev-parse upstream/main)"
+          # `git ls-remote origin main` rather than a local ref: this checkout is
+          # of `vancity`, so origin/main may not be fetched into this workdir.
+          ours_sha="$(git ls-remote origin refs/heads/main | cut -f1)"
+
+          echo "upstream main : $upstream_sha"
+          echo "our mirror    : ${ours_sha:-<absent>}"
+
+          if [ "$upstream_sha" = "$ours_sha" ] && [ "${{ inputs.force }}" != "true" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            # Fast-forward only. If this ever fails, someone hand-edited `main`
+            # and the branch contract above is broken — fix that rather than
+            # forcing, or the image stops corresponding to upstream's source
+            # (which is also the AGPL obligation).
+            git push origin "$upstream_sha:refs/heads/main"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+          echo "short=$(git rev-parse --short=7 upstream/main)" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build and push
+    needs: sync
+    if: needs.sync.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout the exact upstream commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+          # Upstream's Dockerfile is used verbatim. We add nothing to the build
+          # context — the image is their source, only our registry.
+          fetch-depth: 1
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # amd64 only, deliberately. Railway runs amd64, and Odysseus's build
+      # compiles realesrgan wheels from source — an arm64 leg under QEMU roughly
+      # triples wall-clock for a platform nothing here consumes. Add
+      # linux/arm64 to `platforms` below if that ever stops being true.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:stable
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main-${{ needs.sync.outputs.short }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Report the immutable tag
+        run: |
+          echo "### Published" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "${REGISTRY}/${IMAGE_NAME}:main-${{ needs.sync.outputs.short }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "upstream commit ${{ needs.sync.outputs.sha }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "Pin Railway to the main-<sha> tag, never :stable." >> "$GITHUB_STEP_SUMMARY"
