@@ -1,0 +1,63 @@
+name: Sync upstream dev into Railway branch
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: sync-upstream-railway
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    name: Prepare upstream sync pull request
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Check out the Railway deployment branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: railway
+          fetch-depth: 0
+
+      - name: Merge upstream dev and open a pull request
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_REPOSITORY: https://github.com/odysseus-dev/odysseus.git
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM_REPOSITORY"
+          git fetch --no-tags upstream dev
+
+          upstream_sha="$(git rev-parse upstream/dev)"
+          upstream_short="$(git rev-parse --short=12 upstream/dev)"
+
+          if git merge-base --is-ancestor "$upstream_sha" HEAD; then
+            echo "railway already contains upstream dev at $upstream_short" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          sync_branch="sync/upstream-dev-${upstream_short}-${GITHUB_RUN_ID}"
+          git switch -c "$sync_branch"
+          git merge --no-ff --no-edit upstream/dev
+
+          python3 -m json.tool railway.json >/dev/null
+          test -f Dockerfile
+          git diff --check HEAD^ HEAD
+
+          git push origin "$sync_branch"
+
+          pr_url="$(gh pr create \
+            --base railway \
+            --head "$sync_branch" \
+            --title "chore: sync upstream dev at $upstream_short" \
+            --body "On-demand merge of odysseus-dev/odysseus dev at $upstream_sha. Merging this PR updates the Railway source branch and triggers Railway's GitHub deployment.")"
+
+          echo "Opened $pr_url" >> "$GITHUB_STEP_SUMMARY"
