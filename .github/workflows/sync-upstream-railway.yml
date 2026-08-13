@@ -1,4 +1,4 @@
-name: Sync upstream dev into Railway branch
+name: Sync upstream dev and deploy Railway
 
 on:
   workflow_dispatch:
@@ -8,15 +8,12 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   sync:
-    name: Prepare upstream sync pull request
+    name: Merge upstream and update Railway source
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
     steps:
       - name: Check out the Railway deployment branch
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -24,9 +21,8 @@ jobs:
           ref: railway
           fetch-depth: 0
 
-      - name: Merge upstream dev and open a pull request
+      - name: Merge upstream dev and update the Railway branch
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           UPSTREAM_REPOSITORY: https://github.com/odysseus-dev/odysseus.git
         run: |
           set -euo pipefail
@@ -44,20 +40,13 @@ jobs:
             exit 0
           fi
 
-          sync_branch="sync/upstream-dev-${upstream_short}-${GITHUB_RUN_ID}"
-          git switch -c "$sync_branch"
           git merge --no-ff --no-edit upstream/dev
 
           python3 -m json.tool railway.json >/dev/null
           test -f Dockerfile
           git diff --check HEAD^ HEAD
 
-          git push origin "$sync_branch"
+          git push origin HEAD:railway
 
-          pr_url="$(gh pr create \
-            --base railway \
-            --head "$sync_branch" \
-            --title "chore: sync upstream dev at $upstream_short" \
-            --body "On-demand merge of odysseus-dev/odysseus dev at $upstream_sha. Merging this PR updates the Railway source branch and triggers Railway's GitHub deployment.")"
-
-          echo "Opened $pr_url" >> "$GITHUB_STEP_SUMMARY"
+          echo "Updated railway to include upstream dev at $upstream_short." >> "$GITHUB_STEP_SUMMARY"
+          echo "Railway's GitHub source deployment should now be triggered." >> "$GITHUB_STEP_SUMMARY"
